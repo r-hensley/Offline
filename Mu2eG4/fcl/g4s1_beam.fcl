@@ -1,0 +1,116 @@
+# Mu2eG4 config file for Stage 1 of a full from-scratch simulation chain.
+# Simulates 8 GeV primary protons (PrimaryProtonGun) hitting the production
+# target, producing pions and muons which are transported through the
+# transport solenoid (TS).  Particles entering the DS via TS5Vacuum are
+# saved for the muon-stopping stage (g4s2_mstops.fcl).
+#
+# This stage replaces the pre-generated mergedMuonStops files used in the
+# traditional CeEndpoint simulation starting point.
+#
+# Full from-scratch simulation chain for CeEndpointMix1BBSignal:
+#   Stage 1: g4s1_beam.fcl        (this file) - PrimaryProtonGun -> production target -> TS
+#   Stage 2: g4s2_mstops.fcl                  - DS muon transport -> stopping target
+#   Stage 3: g4s3_ceEndpoint.fcl              - CE generation + detector simulation
+#
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardProducers.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+# Give this job a name.
+process_name : g4s1beam
+
+# Start from an empty source (no input file needed)
+source : {
+   module_type : EmptyEvent
+   maxEvents : 100
+}
+
+services : { @table::Services.Sim }
+
+physics : {
+
+   producers: {
+
+      # Generate 8 GeV protons aimed at the production target.
+      # PrimaryProtonGun shoots a Gaussian beam spot onto the target.
+      generate : @local::PrimaryProtonGun
+
+      # Count generated events for bookkeeping.
+      genCounter : { module_type : GenEventCounter }
+
+      # Run Geant4 through the production solenoid and transport solenoid.
+      g4run : @local::g4run
+
+      # Save state of the random number engines.
+      randomsaver : @local::randomsaver
+   }
+
+   filters: {
+
+      # Discard events where Geant4 encountered problems
+      # (status >= 10 means StepPointMCCollections may have bad pointers).
+      g4consistent: {
+         module_type: FilterStatusG4
+         input: "g4run"
+         maxAcceptedStatus: 9
+      }
+   }
+
+   analyzers: {
+      genCountLogger : { module_type : GenEventCountReader }
+   }
+
+   p1 : [generate, genCounter, g4run, g4consistent]
+   e1 : [genCountLogger]
+   o1 : [filteredOutput]
+
+   trigger_paths: [p1]
+   end_paths: [o1, e1]
+}
+
+outputs: {
+
+   # Save only the products needed for the muon-stopping stage (g4s2_mstops.fcl).
+   # The key product is g4run:ts5out (StepPoints at the DS entrance).
+   filteredOutput : {
+      module_type : RootOutput
+      SelectEvents : ["p1"]
+      outputCommands: [
+         "drop *_*_*_*",
+         "keep mu2e::GenParticles_generate_*_*",
+         "keep mu2e::GenEventCount_genCounter_*_*",
+         "keep mu2e::StatusG4_g4run_*_*",
+         "keep *_g4run_ts5out_*",
+         "keep *_g4run_virtualdetector_*",
+         "keep mu2e::PhysicalVolumeInfomvs_g4run_*_*"
+      ]
+      fileName : "sim.owner.g4s1-beam.ver.seq.art"
+   }
+}
+
+# Use ShieldingM for full hadronic physics required for pion/muon production
+# in the production target.
+physics.producers.g4run.physics.physicsListName: "ShieldingM"
+
+# Enable virtual detectors to record particles crossing key surfaces.
+physics.producers.g4run.SDConfig.enableSD: [virtualdetector]
+
+# Save particles that enter TS5Vacuum (the DS entrance) and kill low-energy
+# delta electrons to reduce output file size.
+physics.producers.g4run.Mu2eG4CommonCut: {
+   type: union
+   pars: [
+      @local::mu2eg4CutDeltaElectrons,
+      {
+         type: inVolume
+         pars: [TS5Vacuum]
+         write: ts5out
+      }
+   ]
+}
+
+services.TFileService.fileName: "nts.owner.g4s1-beam.ver.seq.root"
+
+services.SeedService.baseSeed         :  8
+services.SeedService.maxUniqueEngines :  20
