@@ -1,0 +1,123 @@
+# Mu2eG4 config file for Stage 3 of a full from-scratch simulation chain.
+# Reads muon stop positions from g4s2_mstops.fcl via ResamplingMixer,
+# generates conversion electrons using the CeEndpoint module, and runs a
+# full Geant4 detector simulation through the tracker and calorimeter.
+#
+# This stage replaces the traditional approach in which g4test_03.fcl or
+# g4test_mustops.fcl start from pre-generated mergedMuonStops files.
+# By using the muon stops produced by g4s2_mstops.fcl, the entire
+# simulation chain is self-contained and free of pre-computed inputs.
+#
+# Full from-scratch simulation chain for CeEndpointMix1BBSignal:
+#   Stage 1: g4s1_beam.fcl        - PrimaryProtonGun -> production target -> TS
+#   Stage 2: g4s2_mstops.fcl      - DS muon transport -> stopping target
+#   Stage 3: g4s3_ceEndpoint.fcl  (this file) - CE generation + detector simulation
+#
+# Input file is produced by g4s2_mstops.fcl.
+#
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardProducers.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+# Give this job a name.
+process_name : g4s3ceep
+
+# Start from an empty source; muon stops are resampled from the Stage 2 file.
+source : {
+   module_type : EmptyEvent
+   maxEvents : 100
+}
+
+services : { @table::Services.Sim }
+
+physics : {
+
+   filters: {
+
+      # Resample muon stop events from the Stage 2 output.  The ResamplingMixer
+      # draws muon stop SimParticles (from TargetStopFilter) repeatedly so that
+      # many CE events can be generated from a smaller muon stop sample.
+      rsmix: {
+         module_type: ResamplingMixer
+         fileNames: [ "sim.owner.g4s2-mstops.ver.seq.art" ]
+         mu2e: {
+            products: {
+               # Mix in the stopped-muon SimParticles from Stage 2.
+               simParticleMixer: { mixingMap: [ [ "TargetStopFilter", "" ] ] }
+               # Mix in the stopping target step points (virtual detector hits).
+               stepPointMCMixer: { mixingMap: [
+                     [ "TargetStopFilter:virtualdetector", ":" ]
+                  ] }
+               # Mix in the compressed physical volume information.
+               volumeInfoMixer: {
+                  srInput: "compressPVTargetStops"
+                  evtOutInstanceName: "eventlevel"
+               }
+            }
+         }
+      }
+   }
+
+   producers: {
+
+      # Generate a conversion electron from the resampled stopped muon.
+      # inputSimParticles "rsmix" refers to the SimParticles mixed in above.
+      generate: {
+         module_type: CeEndpoint
+         inputSimParticles: "rsmix"
+         verbosity: 1
+      }
+
+      # Run Geant4 full detector simulation for the conversion electron.
+      g4run : @local::g4run
+
+      # Save state of the random number engines.
+      randomsaver : @local::randomsaver
+   }
+
+   analyzers: {
+      validation : { module_type : Validation }
+   }
+
+   p1 : [rsmix, generate, g4run]
+   e1 : [validation]
+   o1 : [fullOutput]
+
+   trigger_paths: [p1]
+   end_paths: [o1, e1]
+}
+
+outputs: {
+   fullOutput : {
+      module_type : RootOutput
+      fileName    : "sim.owner.g4s3-ceEndpoint.ver.seq.art"
+   }
+}
+
+# Use ShieldingM for full hadronic physics in the detector simulation.
+physics.producers.g4run.physics.physicsListName: "ShieldingM"
+
+# Enable all sensitive detectors relevant for reconstruction.
+physics.producers.g4run.SDConfig.enableSD: [
+   tracker, calorimeter, calorimeterRO, CRV, virtualdetector, stoppingtarget
+]
+
+# G4 reads StageParticles produced by the CeEndpoint module.
+# Physical volume info is taken from the ResamplingMixer (rsmix).
+physics.producers.g4run.inputs: {
+   primaryType: StageParticles
+   primaryTag: "generate"
+   inputMCTrajectories: ""
+   simStageOverride: 2
+   inputPhysVolumeMultiInfo: "rsmix"
+   updateEventLevelVolumeInfos: {
+      input: "rsmix:eventlevel"
+      outInstance: "eventlevel"
+   }
+}
+
+services.TFileService.fileName: "nts.owner.g4s3-ceEndpoint.ver.seq.root"
+
+services.SeedService.baseSeed         :  8
+services.SeedService.maxUniqueEngines :  20

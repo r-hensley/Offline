@@ -1,0 +1,124 @@
+# Mu2eG4 config file for Stage 2 of a full from-scratch simulation chain.
+# Reads particles at the DS entrance (TS5Vacuum StepPoints) saved by
+# g4s1_beam.fcl and continues Geant4 through the detector solenoid (DS),
+# simulating muon transport and stopping in the aluminum stopping target.
+# Events with particles reaching the stopping target are filtered and
+# compressed for use by the CE generation stage (g4s3_ceEndpoint.fcl).
+#
+# Full from-scratch simulation chain for CeEndpointMix1BBSignal:
+#   Stage 1: g4s1_beam.fcl        - PrimaryProtonGun -> production target -> TS
+#   Stage 2: g4s2_mstops.fcl      (this file) - DS muon transport -> stopping target
+#   Stage 3: g4s3_ceEndpoint.fcl              - CE generation + detector simulation
+#
+# Input file is produced by g4s1_beam.fcl.
+#
+
+#include "Offline/fcl/minimalMessageService.fcl"
+#include "Offline/fcl/standardProducers.fcl"
+#include "Offline/fcl/standardServices.fcl"
+
+# Give this job a name.
+process_name : g4s2mstops
+
+# Read particles saved at the DS entrance by Stage 1.
+source : {
+   module_type : RootInput
+   fileNames: [ "sim.owner.g4s1-beam.ver.seq.art" ]
+}
+
+services : { @table::Services.Sim }
+
+physics : {
+
+   producers: {
+
+      # Continue Geant4 from the TS5Vacuum StepPoints saved by Stage 1.
+      g4run : @local::g4run
+
+      # Compress physical volume information keeping only volumes relevant
+      # to the stopped muons retained by TargetStopFilter.
+      compressPVTargetStops : {
+         module_type    : CompressPhysicalVolumes
+         volumesInput   : "g4run"
+         hitInputs      : []
+         particleInputs : [ "TargetStopFilter" ]
+      }
+
+      # Save state of the random number engines.
+      randomsaver : @local::randomsaver
+   }
+
+   filters: {
+
+      # Discard events where Geant4 encountered problems.
+      g4consistent: {
+         module_type: FilterStatusG4
+         input: "g4run"
+         maxAcceptedStatus: 9
+      }
+
+      # Keep only events where particles reached the stopping target.
+      # The output SimParticleCollection from this filter is labeled
+      # "TargetStopFilter" and is consumed directly by the CeEndpoint
+      # module in Stage 3 (g4s3_ceEndpoint.fcl).
+      TargetStopFilter : {
+         module_type    : FilterG4Out
+         mainHitInputs  : [ "g4run:stoppingtarget" ]
+         extraHitInputs : [ "g4run:virtualdetector" ]
+         vetoDaughters  : []
+      }
+   }
+
+   analyzers: {
+      genCountLogger : { module_type : GenEventCountReader }
+   }
+
+   p1 : [g4run, g4consistent, TargetStopFilter, compressPVTargetStops]
+   e1 : [genCountLogger]
+   o1 : [filteredOutput]
+
+   trigger_paths: [p1]
+   end_paths: [o1, e1]
+}
+
+outputs: {
+
+   # Save only the stopped-particle products needed by Stage 3.
+   # The TargetStopFilter products are the stopped muon SimParticles.
+   # The compressPVTargetStops product is the compressed volume info.
+   filteredOutput : {
+      module_type : RootOutput
+      SelectEvents : ["p1"]
+      outputCommands: [
+         "drop *_*_*_*",
+         "keep mu2e::StatusG4_g4run_*_*",
+         "keep *_TargetStopFilter_*_*",
+         "keep *_compressPVTargetStops_*_*"
+      ]
+      fileName : "sim.owner.g4s2-mstops.ver.seq.art"
+   }
+}
+
+# Continue Geant4 from the TS5Vacuum StepPoints saved by Stage 1.
+physics.producers.g4run.inputs: {
+   primaryType: StepPoints
+   primaryTag: "g4run:ts5out"
+   inputMCTrajectories: ""
+   simStageOverride: 1
+   inputPhysVolumeMultiInfo: "g4run"
+}
+
+# Use ShieldingM for full hadronic physics.
+physics.producers.g4run.physics.physicsListName: "ShieldingM"
+
+# Enable the stopping target and virtual detector sensitive detectors.
+# The stoppingtarget SD records particles entering the Al stopping target foils.
+physics.producers.g4run.SDConfig.enableSD: [stoppingtarget, virtualdetector]
+
+# Kill delta electrons to keep the output file size manageable.
+physics.producers.g4run.Mu2eG4CommonCut: @local::mu2eg4CutDeltaElectrons
+
+services.TFileService.fileName: "nts.owner.g4s2-mstops.ver.seq.root"
+
+services.SeedService.baseSeed         :  8
+services.SeedService.maxUniqueEngines :  20
