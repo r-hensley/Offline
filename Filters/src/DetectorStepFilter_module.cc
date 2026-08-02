@@ -68,6 +68,9 @@ namespace mu2e {
 
         fhicl::OptionalTable<TimeCutConfig> timeCutConfig { fhicl::Name("TimeCutConfig") };
 
+        fhicl::Atom<bool> logFailures { Name("LogFailures"), Comment("Log per-event failure reasons"), false };
+        fhicl::Atom<unsigned> maxFailureLogs { Name("MaxFailureLogs"), Comment("Maximum number of failed events to log"), 20u };
+
       };
 
       using Parameters = art::EDFilter::Table<Config>;
@@ -90,6 +93,9 @@ namespace mu2e {
       bool timecut_;
       double minTime_, maxTime_;
       unsigned nEvt_, nPassed_;
+      bool logFailures_;
+      unsigned maxFailureLogs_;
+      unsigned nFailureLogs_;
   };
 
   //================================================================
@@ -111,6 +117,9 @@ namespace mu2e {
     , minTime_(0.0), maxTime_(0.0)
     , nEvt_(0)
     , nPassed_(0)
+    , logFailures_(conf().logFailures())
+    , maxFailureLogs_(conf().maxFailureLogs())
+    , nFailureLogs_(0)
     {
       for(const auto ikeep : conf().keepPDG()) { pdgToKeep_.emplace_back(PDGCode::type(ikeep)); }
       for(const auto& trktag : conf().trkSteps()) { trkStepCols_.emplace_back(trktag); consumes<StrawGasStepCollection>(trktag); }
@@ -130,6 +139,8 @@ namespace mu2e {
   bool DetectorStepFilter::filter(art::Event& event) {
     double mbtime = GlobalConstantsHandle<PhysicsParams>()->getNominalDRPeriod();
     bool selecttrk(false), selectcalo(false), selectcrv(false);
+    unsigned bestTrkCount(0), bestCrvCount(0);
+    double bestCaloSum(0.0);
     ++nEvt_;
     // Count Trk step from same particle
     using CT = std::map<const SimParticle*,unsigned>;
@@ -150,6 +161,7 @@ namespace mu2e {
         }
       }
       for(auto itrk=counttrk.begin();itrk != counttrk.end();itrk++){
+        if(itrk->second > bestTrkCount) bestTrkCount = itrk->second;
         if(itrk->second >= minNTrk_ && itrk->second <= maxNTrk_ ){
           selecttrk = true;
           break;
@@ -175,6 +187,7 @@ namespace mu2e {
         }
       }
       for(auto icalo=caloESum.begin();icalo != caloESum.end();icalo++){
+        if(icalo->second > bestCaloSum) bestCaloSum = icalo->second;
         if(icalo->second >= minSumCaloE_ && icalo->second <= maxSumCaloE_ ){
           selectcalo = true;
           break;
@@ -201,6 +214,7 @@ namespace mu2e {
         }
       }
       for(auto icrv=countcrv.begin();icrv != countcrv.end();icrv++){
+        if(icrv->second > bestCrvCount) bestCrvCount = icrv->second;
         if(icrv->second >= minNCrv_ && icrv->second <= maxNCrv_){
           selectcrv = true;
           break;
@@ -212,6 +226,19 @@ namespace mu2e {
     bool retval =( (or_ && (selecttrk || selectcalo || selectcrv)) ||
         ((!or_) && ( selecttrk && selectcalo && selectcrv)) );
     if(retval)nPassed_++;
+    if(!retval && logFailures_ && nFailureLogs_ < maxFailureLogs_) {
+      mf::LogInfo("DetectorStepFilterFailure")
+        << "DetectorStepFilter failed event " << event.id()
+        << " ; ORRequirements=" << or_
+        << " ; tracker: best=" << bestTrkCount << " required=[" << minNTrk_ << "," << maxNTrk_ << "]"
+        << " ; calo sum: best=" << bestCaloSum << " required=[" << minSumCaloE_ << "," << maxSumCaloE_ << "]"
+        << " ; CRV: best=" << bestCrvCount << " required=[" << minNCrv_ << "," << maxNCrv_ << "]";
+      ++nFailureLogs_;
+      if(nFailureLogs_ == maxFailureLogs_) {
+        mf::LogInfo("DetectorStepFilterFailure")
+          << "Reached MaxFailureLogs=" << maxFailureLogs_ << "; suppressing further per-event failure logs.";
+      }
+    }
     return retval;
   }
 
