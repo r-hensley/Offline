@@ -8,6 +8,8 @@
 // mu2eKinKal classes
 //KinKal classes
 #include "KinKal/Detector/ResidualHit.hh"
+#include "KinKal/Fit/AcceptedFitReference.hh"
+#include "Offline/Mu2eKinKal/inc/KKStrawHitLocalReference.hh"
 #include "Offline/Mu2eKinKal/inc/WireHitState.hh"
 #include "KinKal/Trajectory/ParticleTrajectory.hh"
 #include "KinKal/Trajectory/SensorLine.hh"
@@ -44,6 +46,7 @@ namespace mu2e {
     public:
       using HIT = KinKal::Hit<KTRAJ>;
       using RESIDHIT = KinKal::ResidualHit<KTRAJ>;
+      using LOCALREFERENCE = KKStrawHitLocalReference<KTRAJ>;
       using PTRAJ = KinKal::ParticleTrajectory<KTRAJ>;
       using KTRAJPTR = std::shared_ptr<KTRAJ>;
       using CA = KinKal::ClosestApproach<KTRAJ,SensorLine>;
@@ -62,7 +65,8 @@ namespace mu2e {
           shindex_(rhs.strawHitIndex()),
           straw_(rhs.straw()),
           sresponse_(rhs.strawResponse()){
-        /**/
+        // A clone must establish its own weight-generation/posterior association.
+        LOCALREFERENCE::reset(this);
       };
       std::shared_ptr< KinKal::Hit<KTRAJ> > clone(CloneContext& context) const override{
         auto rv = std::make_shared< KKStrawHit<KTRAJ> >(*this);
@@ -141,6 +145,7 @@ namespace mu2e {
     ca_(static_cast<CA const&>(pca)),
     chit_(chit), shindex_(shindex), straw_(straw), sresponse_(sresponse)
   {
+    LOCALREFERENCE::reset(this); // discard a previous object at this address
     if(!pca.usable())whstate_.state_ = WireHitState::unusable;
     // make sure this is a single-straw based ComboHit
     if(chit_.mask().level() != StrawIdMask::uniquestraw)
@@ -150,12 +155,58 @@ namespace mu2e {
   template <class KTRAJ> KinKal::ClosestApproach<KTRAJ,SensorLine> KKStrawHit<KTRAJ>::unbiasedClosestApproach() const {
     // compute the unbiased closest approach; this is brute force, but works
     auto const& ca = this->closestApproach();
+    if(LOCALREFERENCE::enabled()) {
+      auto const& local = LOCALREFERENCE::cache(this);
+      const bool useLocal = this->active() && local.weightKnown &&
+        local.posteriorActive && local.posterior &&
+        local.posteriorGeneration == local.weightGeneration &&
+        local.posterior->range().inRange(local.particleTime) &&
+        LOCALREFERENCE::sameWeight(this->weight(),local.weight);
+      if(useLocal) {
+        // Subtract the exact cached information from the accepted posterior
+        // at the time at which that information was formed. Both the mean
+        // and covariance come from this same subtraction.
+        KinKal::Weights removed(local.posterior->params());
+        removed -= local.weight;
+        auto utraj = std::make_shared<KTRAJ>(KinKal::Parameters(removed),*local.posterior);
+        const CAHint hint(local.particleTime,local.sensorTime);
+        CA uca(utraj,wirePtr(),hint,ca.precision());
+        const double sensorOffset = (uca.sensorTraj().position3(uca.sensorToca()) -
+          uca.sensorTraj().start()).Dot(uca.sensorTraj().direction());
+        // An out-of-piece CA still extrapolates this one piece. Count it;
+        // this diagnostic does not supply the missing material transport.
+        LOCALREFERENCE::record(true,local.posterior->range().inRange(uca.particleToca()),
+          sensorOffset >= 0.0 && sensorOffset <= uca.sensorTraj().length(),uca.usable());
+        return uca;
+      }
+      // Initialization, inactive hits, clones, changed weights and unsupported
+      // old times retain the existing behavior. They are not claimed repaired.
+      LOCALREFERENCE::record(false,false,false,false);
+    }
     auto uparams = HIT::unbiasedParameters();
     auto utraj = std::make_shared<KTRAJ>(uparams,ca.particleTraj());
     return CA(utraj,wirePtr(),ca.hint(),ca.precision());
   }
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateReference(PTRAJ const& ptraj) {
+    if(LOCALREFERENCE::enabled()) {
+      auto& local = LOCALREFERENCE::cache(this);
+      local.posterior.reset();
+      local.posteriorGeneration = 0;
+      local.posteriorActive = false;
+      // Capture BEFORE the biased closest-approach search moves the reference.
+      // An ordinary construction or domain replacement is not a new posterior.
+      if(KinKal::AcceptedFitReference<KTRAJ>::matches(ptraj) && local.weightKnown &&
+          std::isfinite(local.particleTime) && std::isfinite(local.sensorTime) &&
+          ptraj.range().inRange(local.particleTime)) {
+        auto const& posterior = ptraj.nearestPiece(local.particleTime);
+        if(posterior.range().inRange(local.particleTime)) {
+          local.posterior = std::make_shared<KTRAJ>(posterior);
+          local.posteriorGeneration = local.weightGeneration;
+          local.posteriorActive = this->active();
+        }
+      }
+    }
     // if we already computed PCA in the previous iteration, use that to set the hint.  This speeds convergence
     // otherwise use the time at the center of the wire, corrected for drift
     auto mtime =wire().timeAtMidpoint();
@@ -211,6 +262,17 @@ namespace mu2e {
     // update residuals and weights every iteration, regardless of updater algorithm
     setResiduals(whstate_, resids_);
     this->updateWeight(miconfig); // this uses temperature from miconfig
+    if(LOCALREFERENCE::enabled()) {
+      auto& local = LOCALREFERENCE::cache(this);
+      local.weight = this->weight();
+      local.particleTime = ca_.particleToca();
+      local.sensorTime = ca_.sensorToca();
+      local.weightKnown = true;
+      ++local.weightGeneration;
+      local.posterior.reset();
+      local.posteriorGeneration = 0;
+      local.posteriorActive = false;
+    }
   }
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::setState(WireHitState const& whstate) {
