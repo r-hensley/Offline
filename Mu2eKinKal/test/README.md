@@ -39,4 +39,10 @@ On 2026-10-15, both versions compiled with GCC 13.3.0, ROOT 6.32.06 and
 OpenBLAS 0.3.28 in an existing p103 environment. The single-hit header passed;
 the former batch-32 header failed with a segmentation violation in BLAS input
 copying. These standalone checks preceded the instruction to stop further tests.
-The newly selected upstream p108 environment has not been tested here.
+
+The corrected evaluator also built successfully through all seven Mu2eKinKal
+library/module targets at upstream Offline
+`8fdf0eadfc1758810cacd7da6cdedc6895ac4862`, using a KinKal v3.8.0-based
+development build, p108, ROOT 6.38.00 and GCC 13.3.0. This checks compilation
+through current consumers; it does not establish runtime loading or fit behavior.
+No regression or reconstruction tests were run in p108.
