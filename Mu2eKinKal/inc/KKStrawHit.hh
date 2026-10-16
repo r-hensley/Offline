@@ -8,6 +8,8 @@
 // mu2eKinKal classes
 //KinKal classes
 #include "KinKal/Detector/ResidualHit.hh"
+#include "KinKal/Fit/AcceptedFitReference.hh"
+#include "KinKal/Trajectory/KinematicLine.hh"
 #include "Offline/Mu2eKinKal/inc/WireHitState.hh"
 #include "KinKal/Trajectory/ParticleTrajectory.hh"
 #include "KinKal/Trajectory/SensorLine.hh"
@@ -29,6 +31,7 @@
 #include "cetlib_except/exception.h"
 #include <memory>
 #include <cmath>
+#include <type_traits>
 namespace mu2e {
   using KinKal::BFieldMap;
   using KinKal::SensorLine;
@@ -62,7 +65,7 @@ namespace mu2e {
           shindex_(rhs.strawHitIndex()),
           straw_(rhs.straw()),
           sresponse_(rhs.strawResponse()){
-        /**/
+        // A clone must establish its own weight/posterior association.
       };
       std::shared_ptr< KinKal::Hit<KTRAJ> > clone(CloneContext& context) const override{
         auto rv = std::make_shared< KKStrawHit<KTRAJ> >(*this);
@@ -106,6 +109,21 @@ namespace mu2e {
       auto const& driftVariance() { return dVar_; }
       auto const& driftVelocity() { return dDdT_; }
     private:
+      struct LocalReference {
+        bool weightKnown = false;
+        KinKal::Weights weight;
+        CAHint hint{0.0,0.0};
+        KTRAJPTR posterior;
+      } local_; // default-initialized, including in the copy constructor
+      static bool sameWeight(KinKal::Weights const& a, KinKal::Weights const& b) {
+        // Exact identity of both information components, not a numerical tolerance.
+        for(unsigned i=0; i<KinKal::NParams(); ++i) {
+          if(a.weightVec()[i] != b.weightVec()[i]) return false;
+          for(unsigned j=0; j<KinKal::NParams(); ++j)
+            if(a.weightMat()(i,j) != b.weightMat()(i,j)) return false;
+        }
+        return true;
+      }
       BFieldMap const& bfield_; // drift calculation requires the BField for ExB effects
       WireHitState whstate_; // current state
       double dVar_; // drift distance variance value
@@ -148,14 +166,35 @@ namespace mu2e {
   }
 
   template <class KTRAJ> KinKal::ClosestApproach<KTRAJ,SensorLine> KKStrawHit<KTRAJ>::unbiasedClosestApproach() const {
-    // compute the unbiased closest approach; this is brute force, but works
     auto const& ca = this->closestApproach();
+    if(this->active() &&
+        local_.posterior && local_.posterior->range().inRange(local_.hint.particleToca_) &&
+        sameWeight(this->weight(),local_.weight)) {
+      // Remove the original hit information from the NEW fitted state at the OLD
+      // measurement time. Subtract both matrix and vector to update covariance and mean.
+      KinKal::Weights removed(local_.posterior->params());
+      removed -= local_.weight;
+      auto utraj = std::make_shared<KTRAJ>(KinKal::Parameters(removed),*local_.posterior);
+      // CA may leave this piece: this remains a local extrapolation, without
+      // transporting the hit-removed state through material. Inversion errors propagate.
+      return CA(utraj,wirePtr(),local_.hint,ca.precision());
+    }
+    // No valid association (e.g. initialization or clone): retain the existing calculation.
     auto uparams = HIT::unbiasedParameters();
     auto utraj = std::make_shared<KTRAJ>(uparams,ca.particleTraj());
     return CA(utraj,wirePtr(),ca.hint(),ca.precision());
   }
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateReference(PTRAJ const& ptraj) {
+    local_.posterior.reset(); // every reassignment invalidates the previous posterior
+    if(std::is_same_v<KTRAJ,KinKal::KinematicLine> && local_.weightKnown && this->active() &&
+        KinKal::AcceptedFitReference<KTRAJ>::matches(ptraj) &&
+        std::isfinite(local_.hint.particleToca_) && std::isfinite(local_.hint.sensorToca_) &&
+        ptraj.range().inRange(local_.hint.particleToca_)) {
+      auto const& posterior = ptraj.nearestPiece(local_.hint.particleToca_);
+      if(posterior.range().inRange(local_.hint.particleToca_))
+        local_.posterior = std::make_shared<KTRAJ>(posterior); // own the accepted state
+    }
     // if we already computed PCA in the previous iteration, use that to set the hint.  This speeds convergence
     // otherwise use the time at the center of the wire, corrected for drift
     auto mtime =wire().timeAtMidpoint();
@@ -207,10 +246,16 @@ namespace mu2e {
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateState(MetaIterConfig const& miconfig,bool first) {
     // first iteration of a new meta-iteration, update the wire hit state
+    // updateWHS consumes the previous weight/posterior before we replace them.
     if(first)updateWHS(miconfig);
     // update residuals and weights every iteration, regardless of updater algorithm
     setResiduals(whstate_, resids_);
     this->updateWeight(miconfig); // this uses temperature from miconfig
+    // Invalidate on EVERY weight update; only a later accepted fit can supply a posterior.
+    local_ = LocalReference{};
+    local_.weightKnown = true;
+    local_.weight = this->weight(); // includes the original derivatives and temperature
+    local_.hint = ca_.hint();
   }
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::setState(WireHitState const& whstate) {
