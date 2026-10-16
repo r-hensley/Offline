@@ -115,8 +115,6 @@ namespace mu2e {
     struct KKLineModuleConfig : public KKModuleConfig {
       fhicl::Sequence<art::InputTag> seedCollections         {Name("CosmicTrackSeedCollections"),     Comment("Seed fit collections to be processed ") };
       fhicl::Atom<float> seedmom { Name("SeedMomentum"), Comment("Initial momentum value")};
-      fhicl::Atom<bool> experimentalLocalReference { Name("ExperimentalUnbiasedLocalReference"),
-        Comment("Subtract straw-hit information at its accepted old-time local reference"), false };
       fhicl::Sequence<double> paramconstraints { Name("ParameterConstraints"), Comment("Sigma of direct gaussian constraints on each parameter (0=no constraint)")};
       fhicl::Sequence<std::string> sampleSurfaces { Name("SampleSurfaces"), Comment("When creating the KalSeed, sample the fit at these surfaces") };
       fhicl::Atom<bool> sampleInRange { Name("SampleInRange"), Comment("Require sample times to be inside the fit trajectory time range") };
@@ -157,7 +155,6 @@ namespace mu2e {
     ProditionsHandle<Tracker> alignedTracker_h_;
     int print_;
     float seedmom_;
-    bool experimentalLocalReference_;
     std::vector<double> paramconstraints_;
     PDGCode::type fpart_;
     TrkFitDirection fdir_;
@@ -184,7 +181,6 @@ namespace mu2e {
     saveall_(settings().modSettings().saveAll()),
     print_(settings().modSettings().printLevel()),
     seedmom_(settings().modSettings().seedmom()),
-    experimentalLocalReference_(settings().modSettings().experimentalLocalReference()),
     paramconstraints_(settings().modSettings().paramconstraints()),
     fpart_(static_cast<PDGCode::type>(settings().modSettings().fitParticle())),
     kkfit_(settings().mu2eSettings()),
@@ -195,9 +191,6 @@ namespace mu2e {
     config_(Mu2eKinKal::makeConfig(settings().fitSettings())),
     exconfig_(Mu2eKinKal::makeConfig(settings().extSettings()))
     {
-      // Cached information is not transported between magnetic-field parameter frames.
-      if(experimentalLocalReference_ && (config_.bfcorr_ || exconfig_.bfcorr_))
-        throw cet::exception("RECO") << "ExperimentalUnbiasedLocalReference does not support magnetic domain transport";
       std::string fdir;
       if(settings().fitDirection(fdir))fdir_ = fdir;
       // collection handling
@@ -248,7 +241,6 @@ namespace mu2e {
   }
 
   void KinematicLineFit::produce(art::Event& event ) {
-    const KKStrawHit<KTRAJ>::LocalReferenceScope localReferenceScope(experimentalLocalReference_);
     GeomHandle<mu2e::Calorimeter> calo_h;
     GeomHandle<mu2e::Tracker> nominalTracker_h;
 

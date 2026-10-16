@@ -9,6 +9,7 @@
 //KinKal classes
 #include "KinKal/Detector/ResidualHit.hh"
 #include "KinKal/Fit/AcceptedFitReference.hh"
+#include "KinKal/Trajectory/KinematicLine.hh"
 #include "Offline/Mu2eKinKal/inc/WireHitState.hh"
 #include "KinKal/Trajectory/ParticleTrajectory.hh"
 #include "KinKal/Trajectory/SensorLine.hh"
@@ -31,6 +32,7 @@
 #include "cetlib_except/exception.h"
 #include <memory>
 #include <cmath>
+#include <type_traits>
 namespace mu2e {
   using KinKal::BFieldMap;
   using KinKal::SensorLine;
@@ -43,20 +45,7 @@ namespace mu2e {
   using RESIDCOL = std::array<Residual,3>; // should be a struct FIXME
 
   template <class KTRAJ> class KKStrawHit : public KinKal::ResidualHit<KTRAJ> {
-      using ScopeId = std::shared_ptr<char const>;
-      inline static thread_local ScopeId localReferenceScope_;
     public:
-      // Enable only within the owning module call; each scope has a distinct identity.
-      class LocalReferenceScope {
-        ScopeId previous_;
-        public:
-          explicit LocalReferenceScope(bool enabled) : previous_(localReferenceScope_) {
-            localReferenceScope_ = enabled ? std::make_shared<char const>(0) : nullptr;
-          }
-          ~LocalReferenceScope() { localReferenceScope_ = previous_; }
-          LocalReferenceScope(LocalReferenceScope const&) = delete;
-          LocalReferenceScope& operator=(LocalReferenceScope const&) = delete;
-      };
       using HIT = KinKal::Hit<KTRAJ>;
       using RESIDHIT = KinKal::ResidualHit<KTRAJ>;
       using PTRAJ = KinKal::ParticleTrajectory<KTRAJ>;
@@ -123,7 +112,7 @@ namespace mu2e {
       auto const& driftVelocity() { return dDdT_; }
     private:
       struct LocalReference {
-        ScopeId scope;
+        bool weightKnown = false;
         KinKal::Weights weight;
         CAHint hint{0.0,0.0};
         KTRAJPTR posterior;
@@ -180,7 +169,7 @@ namespace mu2e {
 
   template <class KTRAJ> KinKal::ClosestApproach<KTRAJ,SensorLine> KKStrawHit<KTRAJ>::unbiasedClosestApproach() const {
     auto const& ca = this->closestApproach();
-    if(localReferenceScope_ && local_.scope == localReferenceScope_ && this->active() &&
+    if(this->active() &&
         local_.posterior && local_.posterior->range().inRange(local_.hint.particleToca_) &&
         sameWeight(this->weight(),local_.weight)) {
       // Remove the original hit information from the NEW fitted state at the OLD
@@ -200,7 +189,7 @@ namespace mu2e {
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateReference(PTRAJ const& ptraj) {
     local_.posterior.reset(); // every reassignment invalidates the previous posterior
-    if(localReferenceScope_ && local_.scope == localReferenceScope_ && this->active() &&
+    if(std::is_same_v<KTRAJ,KinKal::KinematicLine> && local_.weightKnown && this->active() &&
         KinKal::AcceptedFitReference<KTRAJ>::matches(ptraj) &&
         std::isfinite(local_.hint.particleToca_) && std::isfinite(local_.hint.sensorToca_) &&
         ptraj.range().inRange(local_.hint.particleToca_)) {
@@ -268,11 +257,9 @@ namespace mu2e {
     this->updateWeight(miconfig); // this uses temperature from miconfig
     // Invalidate on EVERY weight update; only a later accepted fit can supply a posterior.
     local_ = LocalReference{};
-    if(localReferenceScope_) {
-      local_.scope = localReferenceScope_;
-      local_.weight = this->weight(); // includes the original derivatives and temperature
-      local_.hint = ca_.hint();
-    }
+    local_.weightKnown = true;
+    local_.weight = this->weight(); // includes the original derivatives and temperature
+    local_.hint = ca_.hint();
   }
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::setState(WireHitState const& whstate) {
