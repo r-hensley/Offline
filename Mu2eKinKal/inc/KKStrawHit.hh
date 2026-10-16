@@ -9,7 +9,6 @@
 //KinKal classes
 #include "KinKal/Detector/ResidualHit.hh"
 #include "KinKal/Fit/AcceptedFitReference.hh"
-#include "Offline/Mu2eKinKal/inc/KKStrawHitLocalReference.hh"
 #include "Offline/Mu2eKinKal/inc/WireHitState.hh"
 #include "KinKal/Trajectory/ParticleTrajectory.hh"
 #include "KinKal/Trajectory/SensorLine.hh"
@@ -44,10 +43,22 @@ namespace mu2e {
   using RESIDCOL = std::array<Residual,3>; // should be a struct FIXME
 
   template <class KTRAJ> class KKStrawHit : public KinKal::ResidualHit<KTRAJ> {
+      using ScopeId = std::shared_ptr<char const>;
+      inline static thread_local ScopeId localReferenceScope_;
     public:
+      // Enable only within the owning module call; each scope has a distinct identity.
+      class LocalReferenceScope {
+        ScopeId previous_;
+        public:
+          explicit LocalReferenceScope(bool enabled) : previous_(localReferenceScope_) {
+            localReferenceScope_ = enabled ? std::make_shared<char const>(0) : nullptr;
+          }
+          ~LocalReferenceScope() { localReferenceScope_ = previous_; }
+          LocalReferenceScope(LocalReferenceScope const&) = delete;
+          LocalReferenceScope& operator=(LocalReferenceScope const&) = delete;
+      };
       using HIT = KinKal::Hit<KTRAJ>;
       using RESIDHIT = KinKal::ResidualHit<KTRAJ>;
-      using LOCALREFERENCE = KKStrawHitLocalReference<KTRAJ>;
       using PTRAJ = KinKal::ParticleTrajectory<KTRAJ>;
       using KTRAJPTR = std::shared_ptr<KTRAJ>;
       using CA = KinKal::ClosestApproach<KTRAJ,SensorLine>;
@@ -67,10 +78,7 @@ namespace mu2e {
           shindex_(rhs.strawHitIndex()),
           straw_(rhs.straw()),
           sresponse_(rhs.strawResponse()){
-        // Copying the hit's geometry does not establish that the clone's weight
-        // was assimilated into a particular posterior. Start a new association
-        // after its own updateWeight / accepted-fit cycle; never inherit rhs's.
-        LOCALREFERENCE::reset(this);
+        // A clone must establish its own weight/posterior association.
       };
       std::shared_ptr< KinKal::Hit<KTRAJ> > clone(CloneContext& context) const override{
         auto rv = std::make_shared< KKStrawHit<KTRAJ> >(*this);
@@ -114,6 +122,21 @@ namespace mu2e {
       auto const& driftVariance() { return dVar_; }
       auto const& driftVelocity() { return dDdT_; }
     private:
+      struct LocalReference {
+        ScopeId scope;
+        KinKal::Weights weight;
+        CAHint hint{0.0,0.0};
+        KTRAJPTR posterior;
+      } local_; // default-initialized, including in the copy constructor
+      static bool sameWeight(KinKal::Weights const& a, KinKal::Weights const& b) {
+        // Exact identity of both information components, not a numerical tolerance.
+        for(unsigned i=0; i<KinKal::NParams(); ++i) {
+          if(a.weightVec()[i] != b.weightVec()[i]) return false;
+          for(unsigned j=0; j<KinKal::NParams(); ++j)
+            if(a.weightMat()(i,j) != b.weightMat()(i,j)) return false;
+        }
+        return true;
+      }
       BFieldMap const& bfield_; // drift calculation requires the BField for ExB effects
       WireHitState whstate_; // current state
       double dVar_; // drift distance variance value
@@ -149,7 +172,6 @@ namespace mu2e {
     ca_(static_cast<CA const&>(pca)),
     chit_(chit), shindex_(shindex), straw_(straw), sresponse_(sresponse)
   {
-    LOCALREFERENCE::reset(this); // discard a previous object at this address
     if(!pca.usable())whstate_.state_ = WireHitState::unusable;
     // make sure this is a single-straw based ComboHit
     if(chit_.mask().level() != StrawIdMask::uniquestraw)
@@ -157,91 +179,34 @@ namespace mu2e {
   }
 
   template <class KTRAJ> KinKal::ClosestApproach<KTRAJ,SensorLine> KKStrawHit<KTRAJ>::unbiasedClosestApproach() const {
-    // Removing a hit requires the local posterior into which its cached weight
-    // was fitted. For example, if the next biased CA moves from material piece A
-    // to B, subtracting A's unchanged hit information from B's posterior can give
-    // an indefinite covariance. The optional cache keeps the accepted posterior
-    // at the old measurement time, independently of the current biased ca_.
-    // This is local information removal, not a complete nonlinear hit-free refit.
     auto const& ca = this->closestApproach();
-    if(LOCALREFERENCE::enabled()) {
-      auto const& local = LOCALREFERENCE::cache(this);
-      // Require an active measurement in both the captured fit and the current
-      // hit state. Generation equality ties the posterior to one updateWeight;
-      // full weight equality also guards against changes outside that lifecycle.
-      // These checks establish cache eligibility, not covariance calibration.
-      const bool useLocal = this->active() && local.weightKnown &&
-        local.posteriorActive && local.posterior &&
-        local.posteriorGeneration == local.weightGeneration &&
-        local.posterior->range().inRange(local.particleTime) &&
-        LOCALREFERENCE::sameWeight(this->weight(),local.weight);
-      if(useLocal) {
-        // Weights stores both the information matrix W = C^-1 and vector w = W*a.
-        // Subtract the hit from both: W_removed = W_post - W_hit and likewise w.
-        // Parameters then recovers C_removed and a_removed from that same pair.
-        // Mixing a new-location mean with an old-location covariance would not
-        // perform this operation. Inversion failures propagate; nothing is clipped.
-        KinKal::Weights removed(local.posterior->params());
-        removed -= local.weight;
-        auto utraj = std::make_shared<KTRAJ>(KinKal::Parameters(removed),*local.posterior);
-        // Restart both CA clocks at the cached measurement site. The solver may
-        // move those times; a hint is a starting point, not a constraint. CA uses
-        // only this copied piece, unlike the piecewise search for the biased ca_.
-        const CAHint hint(local.particleTime,local.sensorTime);
-        CA uca(utraj,wirePtr(),hint,ca.precision());
-        // SensorLine's analytic continuation also extends beyond the physical
-        // wire. Project along its unit direction to test the finite wire length.
-        const double sensorOffset = (uca.sensorTraj().position3(uca.sensorToca()) -
-          uca.sensorTraj().start()).Dot(uca.sensorTraj().direction());
-        // A CA outside the copied piece extrapolates its mean and covariance;
-        // it does not cross the intervening material. Count this limitation and
-        // return the diagnostic result, without adding a new hit-rejection rule.
-        // A successful CA or positive projected variance does not validate that
-        // extrapolation as a physical hit-removed prediction.
-        LOCALREFERENCE::record(true,local.posterior->range().inRange(uca.particleToca()),
-          sensorOffset >= 0.0 && sensorOffset <= uca.sensorTraj().length(),uca.usable());
-        return uca;
-      }
-      // Initialization, inactive hits, clones, changed weights and unsupported
-      // old times retain the existing behavior. This fallback means the local
-      // association was unavailable; it does not claim the old calculation is
-      // repaired or its covariance is valid. Exceptions above are not fallbacks.
-      LOCALREFERENCE::record(false,false,false,false);
+    if(localReferenceScope_ && local_.scope == localReferenceScope_ && this->active() &&
+        local_.posterior && local_.posterior->range().inRange(local_.hint.particleToca_) &&
+        sameWeight(this->weight(),local_.weight)) {
+      // Remove the original hit information from the NEW fitted state at the OLD
+      // measurement time. Subtract both matrix and vector to update covariance and mean.
+      KinKal::Weights removed(local_.posterior->params());
+      removed -= local_.weight;
+      auto utraj = std::make_shared<KTRAJ>(KinKal::Parameters(removed),*local_.posterior);
+      // CA may leave this piece: this remains a local extrapolation, without
+      // transporting the hit-removed state through material. Inversion errors propagate.
+      return CA(utraj,wirePtr(),local_.hint,ca.precision());
     }
+    // No valid association (e.g. initialization or clone): retain the existing calculation.
     auto uparams = HIT::unbiasedParameters();
     auto utraj = std::make_shared<KTRAJ>(uparams,ca.particleTraj());
     return CA(utraj,wirePtr(),ca.hint(),ca.precision());
   }
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateReference(PTRAJ const& ptraj) {
-    if(LOCALREFERENCE::enabled()) {
-      auto& local = LOCALREFERENCE::cache(this);
-      // Every reference reassignment invalidates the old snapshot, even if the
-      // call below is ineligible to replace it. Do not let constructor/domain
-      // updates leave a previously accepted association looking current.
-      local.posterior.reset();
-      local.posteriorGeneration = 0;
-      local.posteriorActive = false;
-      // The companion KinKal hook identifies Track::iterate's accepted posterior
-      // attachment. Other callers of updateReference (construction and domain
-      // replacement) do not establish that this fit assimilated the cached weight.
-      // Capture the NEW fitted trajectory at the OLD measurement time before the
-      // biased CA search moves the reference. Reusing the previous iteration's
-      // pre-fit trajectory here would subtract from the wrong statistical state.
-      if(KinKal::AcceptedFitReference<KTRAJ>::matches(ptraj) && local.weightKnown &&
-          std::isfinite(local.particleTime) && std::isfinite(local.sensorTime) &&
-          ptraj.range().inRange(local.particleTime)) {
-        auto const& posterior = ptraj.nearestPiece(local.particleTime);
-        // nearestPiece can select an endpoint for an out-of-range time. Check
-        // actual local support as well as the full-trajectory range above.
-        if(posterior.range().inRange(local.particleTime)) {
-          // Own a value copy: Track replaces its fitted trajectory after reference
-          // attachment, and later operations may mutate shared trajectory pieces.
-          local.posterior = std::make_shared<KTRAJ>(posterior);
-          local.posteriorGeneration = local.weightGeneration;
-          local.posteriorActive = this->active();
-        }
-      }
+    local_.posterior.reset(); // every reassignment invalidates the previous posterior
+    if(localReferenceScope_ && local_.scope == localReferenceScope_ && this->active() &&
+        KinKal::AcceptedFitReference<KTRAJ>::matches(ptraj) &&
+        std::isfinite(local_.hint.particleToca_) && std::isfinite(local_.hint.sensorToca_) &&
+        ptraj.range().inRange(local_.hint.particleToca_)) {
+      auto const& posterior = ptraj.nearestPiece(local_.hint.particleToca_);
+      if(posterior.range().inRange(local_.hint.particleToca_))
+        local_.posterior = std::make_shared<KTRAJ>(posterior); // own the accepted state
     }
     // if we already computed PCA in the previous iteration, use that to set the hint.  This speeds convergence
     // otherwise use the time at the center of the wire, corrected for drift
@@ -296,27 +261,17 @@ namespace mu2e {
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateState(MetaIterConfig const& miconfig,bool first) {
     // first iteration of a new meta-iteration, update the wire hit state
-    // updateWHS may request an unbiased CA using the PREVIOUS weight and its
-    // accepted posterior. It must run before that association is replaced below.
+    // updateWHS consumes the previous weight/posterior before we replace them.
     if(first)updateWHS(miconfig);
     // update residuals and weights every iteration, regardless of updater algorithm
     setResiduals(whstate_, resids_);
     this->updateWeight(miconfig); // this uses temperature from miconfig
-    if(LOCALREFERENCE::enabled()) {
-      auto& local = LOCALREFERENCE::cache(this);
-      // Save the exact information just formed, including the current residual
-      // derivatives and annealing scale. Recomputing it later at a different CA
-      // would no longer identify the measurement actually supplied to this fit.
-      local.weight = this->weight();
-      local.particleTime = ca_.particleToca();
-      local.sensorTime = ca_.sensorToca();
-      local.weightKnown = true;
-      // A new weight starts a new association, even if its numbers happen to be
-      // unchanged. Only a subsequent accepted fit can supply its posterior.
-      ++local.weightGeneration;
-      local.posterior.reset();
-      local.posteriorGeneration = 0;
-      local.posteriorActive = false;
+    // Invalidate on EVERY weight update; only a later accepted fit can supply a posterior.
+    local_ = LocalReference{};
+    if(localReferenceScope_) {
+      local_.scope = localReferenceScope_;
+      local_.weight = this->weight(); // includes the original derivatives and temperature
+      local_.hint = ca_.hint();
     }
   }
 
