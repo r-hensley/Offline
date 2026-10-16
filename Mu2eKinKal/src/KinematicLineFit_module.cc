@@ -201,6 +201,9 @@ namespace mu2e {
     config_(Mu2eKinKal::makeConfig(settings().fitSettings())),
     exconfig_(Mu2eKinKal::makeConfig(settings().extSettings()))
     {
+      // This local subtraction does not transport cached information between
+      // magnetic-field parameter frames. Reject that unsupported combination
+      // in either fit phase, rather than permitting an inconsistent association.
       if(experimentalLocalReference_ && (config_.bfcorr_ || exconfig_.bfcorr_))
         throw cet::exception("RECO") << "ExperimentalUnbiasedLocalReference does not support magnetic domain transport";
       std::string fdir;
@@ -267,6 +270,10 @@ namespace mu2e {
   }
 
   void KinematicLineFit::produce(art::Event& event ) {
+    // One event-local cache covers seed construction, fitting, extension and
+    // output sampling below. RAII restores any enclosing scope on every exit,
+    // including exceptions. Later modules consuming the saved tracks do not
+    // inherit these associations or this optional unbiased-CA behavior.
     const KKStrawHitLocalReference<KTRAJ>::Scope localReferenceScope(experimentalLocalReference_);
     GeomHandle<mu2e::Calorimeter> calo_h;
     GeomHandle<mu2e::Tracker> nominalTracker_h;
@@ -353,6 +360,9 @@ namespace mu2e {
       }
     }
     if(experimentalLocalReference_) {
+      // Aggregate calls across all seeds and sampling in this invocation. A hit
+      // can contribute repeatedly; these counts are diagnostics, not numbers of
+      // recovered tracks or a statement that the returned uncertainties are valid.
       auto const& counts = localReferenceScope.counts();
       std::cout << "ExperimentalUnbiasedLocalReference: local=" << counts.local
         << " legacyFallback=" << counts.fallback

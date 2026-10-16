@@ -65,7 +65,9 @@ namespace mu2e {
           shindex_(rhs.strawHitIndex()),
           straw_(rhs.straw()),
           sresponse_(rhs.strawResponse()){
-        // A clone must establish its own weight-generation/posterior association.
+        // Copying the hit's geometry does not establish that the clone's weight
+        // was assimilated into a particular posterior. Start a new association
+        // after its own updateWeight / accepted-fit cycle; never inherit rhs's.
         LOCALREFERENCE::reset(this);
       };
       std::shared_ptr< KinKal::Hit<KTRAJ> > clone(CloneContext& context) const override{
@@ -153,34 +155,55 @@ namespace mu2e {
   }
 
   template <class KTRAJ> KinKal::ClosestApproach<KTRAJ,SensorLine> KKStrawHit<KTRAJ>::unbiasedClosestApproach() const {
-    // compute the unbiased closest approach; this is brute force, but works
+    // Removing a hit requires the local posterior into which its cached weight
+    // was fitted. For example, if the next biased CA moves from material piece A
+    // to B, subtracting A's unchanged hit information from B's posterior can give
+    // an indefinite covariance. The optional cache keeps the accepted posterior
+    // at the old measurement time, independently of the current biased ca_.
+    // This is local information removal, not a complete nonlinear hit-free refit.
     auto const& ca = this->closestApproach();
     if(LOCALREFERENCE::enabled()) {
       auto const& local = LOCALREFERENCE::cache(this);
+      // Require an active measurement in both the captured fit and the current
+      // hit state. Generation equality ties the posterior to one updateWeight;
+      // full weight equality also guards against changes outside that lifecycle.
+      // These checks establish cache eligibility, not covariance calibration.
       const bool useLocal = this->active() && local.weightKnown &&
         local.posteriorActive && local.posterior &&
         local.posteriorGeneration == local.weightGeneration &&
         local.posterior->range().inRange(local.particleTime) &&
         LOCALREFERENCE::sameWeight(this->weight(),local.weight);
       if(useLocal) {
-        // Subtract the exact cached information from the accepted posterior
-        // at the time at which that information was formed. Both the mean
-        // and covariance come from this same subtraction.
+        // Weights stores both the information matrix W = C^-1 and vector w = W*a.
+        // Subtract the hit from both: W_removed = W_post - W_hit and likewise w.
+        // Parameters then recovers C_removed and a_removed from that same pair.
+        // Mixing a new-location mean with an old-location covariance would not
+        // perform this operation. Inversion failures propagate; nothing is clipped.
         KinKal::Weights removed(local.posterior->params());
         removed -= local.weight;
         auto utraj = std::make_shared<KTRAJ>(KinKal::Parameters(removed),*local.posterior);
+        // Restart both CA clocks at the cached measurement site. The solver may
+        // move those times; a hint is a starting point, not a constraint. CA uses
+        // only this copied piece, unlike the piecewise search for the biased ca_.
         const CAHint hint(local.particleTime,local.sensorTime);
         CA uca(utraj,wirePtr(),hint,ca.precision());
+        // SensorLine's analytic continuation also extends beyond the physical
+        // wire. Project along its unit direction to test the finite wire length.
         const double sensorOffset = (uca.sensorTraj().position3(uca.sensorToca()) -
           uca.sensorTraj().start()).Dot(uca.sensorTraj().direction());
-        // An out-of-piece CA still extrapolates this one piece. Count it;
-        // this diagnostic does not supply the missing material transport.
+        // A CA outside the copied piece extrapolates its mean and covariance;
+        // it does not cross the intervening material. Count this limitation and
+        // return the diagnostic result, without adding a new hit-rejection rule.
+        // A successful CA or positive projected variance does not validate that
+        // extrapolation as a physical hit-removed prediction.
         LOCALREFERENCE::record(true,local.posterior->range().inRange(uca.particleToca()),
           sensorOffset >= 0.0 && sensorOffset <= uca.sensorTraj().length(),uca.usable());
         return uca;
       }
       // Initialization, inactive hits, clones, changed weights and unsupported
-      // old times retain the existing behavior. They are not claimed repaired.
+      // old times retain the existing behavior. This fallback means the local
+      // association was unavailable; it does not claim the old calculation is
+      // repaired or its covariance is valid. Exceptions above are not fallbacks.
       LOCALREFERENCE::record(false,false,false,false);
     }
     auto uparams = HIT::unbiasedParameters();
@@ -191,16 +214,27 @@ namespace mu2e {
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateReference(PTRAJ const& ptraj) {
     if(LOCALREFERENCE::enabled()) {
       auto& local = LOCALREFERENCE::cache(this);
+      // Every reference reassignment invalidates the old snapshot, even if the
+      // call below is ineligible to replace it. Do not let constructor/domain
+      // updates leave a previously accepted association looking current.
       local.posterior.reset();
       local.posteriorGeneration = 0;
       local.posteriorActive = false;
-      // Capture BEFORE the biased closest-approach search moves the reference.
-      // An ordinary construction or domain replacement is not a new posterior.
+      // The companion KinKal hook identifies Track::iterate's accepted posterior
+      // attachment. Other callers of updateReference (construction and domain
+      // replacement) do not establish that this fit assimilated the cached weight.
+      // Capture the NEW fitted trajectory at the OLD measurement time before the
+      // biased CA search moves the reference. Reusing the previous iteration's
+      // pre-fit trajectory here would subtract from the wrong statistical state.
       if(KinKal::AcceptedFitReference<KTRAJ>::matches(ptraj) && local.weightKnown &&
           std::isfinite(local.particleTime) && std::isfinite(local.sensorTime) &&
           ptraj.range().inRange(local.particleTime)) {
         auto const& posterior = ptraj.nearestPiece(local.particleTime);
+        // nearestPiece can select an endpoint for an out-of-range time. Check
+        // actual local support as well as the full-trajectory range above.
         if(posterior.range().inRange(local.particleTime)) {
+          // Own a value copy: Track replaces its fitted trajectory after reference
+          // attachment, and later operations may mutate shared trajectory pieces.
           local.posterior = std::make_shared<KTRAJ>(posterior);
           local.posteriorGeneration = local.weightGeneration;
           local.posteriorActive = this->active();
@@ -258,16 +292,23 @@ namespace mu2e {
 
   template <class KTRAJ> void KKStrawHit<KTRAJ>::updateState(MetaIterConfig const& miconfig,bool first) {
     // first iteration of a new meta-iteration, update the wire hit state
+    // updateWHS may request an unbiased CA using the PREVIOUS weight and its
+    // accepted posterior. It must run before that association is replaced below.
     if(first)updateWHS(miconfig);
     // update residuals and weights every iteration, regardless of updater algorithm
     setResiduals(whstate_, resids_);
     this->updateWeight(miconfig); // this uses temperature from miconfig
     if(LOCALREFERENCE::enabled()) {
       auto& local = LOCALREFERENCE::cache(this);
+      // Save the exact information just formed, including the current residual
+      // derivatives and annealing scale. Recomputing it later at a different CA
+      // would no longer identify the measurement actually supplied to this fit.
       local.weight = this->weight();
       local.particleTime = ca_.particleToca();
       local.sensorTime = ca_.sensorToca();
       local.weightKnown = true;
+      // A new weight starts a new association, even if its numbers happen to be
+      // unchanged. Only a subsequent accepted fit can supply its posterior.
       ++local.weightGeneration;
       local.posterior.reset();
       local.posteriorGeneration = 0;
