@@ -18,7 +18,8 @@ checkout root (whose parent contains the `Offline` directory):
 ```sh
 c++ -std=c++17 -O2 -g $(root-config --cflags) -I.. \
   Mu2eKinKal/test/TrainBkgSingleHit_test.cc \
-  $(root-config --libs) -lROOTTMVASofie -L"$ROOTSYS/lib" -lopenblas \
+  $(root-config --libs) -lROOTTMVASofie \
+  -L"$ROOTSYS/lib" -Wl,-rpath,"$ROOTSYS/lib" -lopenblas \
   -o /tmp/TrainBkgSingleHit_test
 (ulimit -c 0; OPENBLAS_NUM_THREADS=1 /tmp/TrainBkgSingleHit_test)
 ```
