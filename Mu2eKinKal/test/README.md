@@ -18,11 +18,13 @@ checkout root (whose parent contains the `Offline` directory):
 ```sh
 c++ -std=c++17 -O2 -g $(root-config --cflags) -I.. \
   Mu2eKinKal/test/TrainBkgSingleHit_test.cc \
-  $(root-config --libs) -lROOTTMVASofie -lopenblas \
+  $(root-config --libs) -lROOTTMVASofie -L"$ROOTSYS/lib" -lopenblas \
   -o /tmp/TrainBkgSingleHit_test
 (ulimit -c 0; OPENBLAS_NUM_THREADS=1 /tmp/TrainBkgSingleHit_test)
 ```
 
+The command assumes OpenBLAS is in `$ROOTSYS/lib` (the Mu2e p108 product view).
+For another configured installation, use its OpenBLAS library directory.
 Compile this same test with the original header to reproduce the invalid read;
 with the corrected header it must return one correct score per call and exit
 zero. The test uses no trained weights or detector data. It establishes the
